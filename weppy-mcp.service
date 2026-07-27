@@ -1,0 +1,22 @@
+[Unit]
+Description=WEPPY Roblox MCP (public HTTPS via nginx → :8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rafacorps
+WorkingDirectory=/home/rafacorps/weppy-railway
+EnvironmentFile=/home/rafacorps/weppy-railway/.env
+ExecStart=/home/rafacorps/.local/bin/node /home/rafacorps/weppy-railway/start.mjs
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+# Keep stdio detached lifecycle for WEPPY
+Environment=WEPPY_MCP_DETACHED_LIFECYCLE=true
+Environment=DASHBOARD_AUTO_OPEN=false
+Environment=SKIP_PLUGIN_INSTALL=true
+
+[Install]
+WantedBy=default.target

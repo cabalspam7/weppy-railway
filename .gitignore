@@ -1,0 +1,9 @@
+node_modules/
+weppy-project-sync/
+.env
+.env.local
+.mcp_auth_token
+*.log
+.DS_Store
+.railway/
+*.bak-pro

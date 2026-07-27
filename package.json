@@ -1,0 +1,21 @@
+{
+  "name": "weppy-railway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Host WEPPY Roblox MCP on Railway — SSE/Streamable HTTP for AI + public HTTP bridge for Studio plugin",
+  "type": "module",
+  "scripts": {
+    "start": "node start.mjs",
+    "patch:pro": "node patch-pro-bypass.mjs",
+    "patch:pro:restore": "node patch-pro-bypass.mjs --restore",
+    "postinstall": "node patch-pro-bypass.mjs || true"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@weppy/roblox-mcp": "latest",
+    "http-proxy": "^1.18.1",
+    "supergateway": "^3.4.3"
+  }
+}

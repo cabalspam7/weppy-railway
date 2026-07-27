@@ -1,0 +1,20 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "./Dockerfile"
+
+[deploy]
+startCommand = "node start.mjs"
+healthcheckPath = "/railway-health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[env]
+NODE_ENV = "production"
+DASHBOARD_AUTO_OPEN = "false"
+SKIP_PLUGIN_INSTALL = "true"
+WEPPY_MCP_DETACHED_LIFECYCLE = "true"
+HTTP_HOST = "127.0.0.1"
+HTTP_PORT = "3002"
+SUPERGATEWAY_PORT = "8787"
+LOG_LEVEL = "info"
