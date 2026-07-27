@@ -242,10 +242,12 @@ spawnLogged(
   { respawn: true }
 );
 
-// Optional second Streamable HTTP endpoint (stateful) on another internal port
-// Disabled by default — enable with ENABLE_STREAMABLE_HTTP=true
-if (process.env.ENABLE_STREAMABLE_HTTP === "true") {
-  const STREAM_PORT = parseInt(process.env.STREAMABLE_PORT || "8788", 10);
+// Streamable HTTP endpoint (stateful) — Notion Custom Agents prefer /mcp over SSE.
+// Enable with ENABLE_STREAMABLE_HTTP=true (recommended for Notion).
+// Uses a SEPARATE WEPPY process so SSE and Streamable don't share one stdio transport.
+const STREAMABLE_ENABLED = process.env.ENABLE_STREAMABLE_HTTP === "true";
+const STREAM_PORT = parseInt(process.env.STREAMABLE_PORT || "8788", 10);
+if (STREAMABLE_ENABLED) {
   spawnLogged(
     "supergateway-streamable",
     process.execPath,
@@ -255,6 +257,8 @@ if (process.env.ENABLE_STREAMABLE_HTTP === "true") {
       weppyStdioCmd,
       "--port",
       String(STREAM_PORT),
+      "--baseUrl",
+      PUBLIC_BASE_URL,
       "--outputTransport",
       "streamableHttp",
       "--streamableHttpPath",
@@ -265,16 +269,22 @@ if (process.env.ENABLE_STREAMABLE_HTTP === "true") {
       "--healthEndpoint",
       "/healthz",
       "--cors",
+      "--logLevel",
+      LOG_LEVEL === "debug" ? "debug" : "info",
     ],
     {
+      // Separate HTTP bridge port so it doesn't clash with the SSE WEPPY instance
       HTTP_HOST: "127.0.0.1",
       HTTP_PORT: String(WEPPY_HTTP_PORT + 1),
       DASHBOARD_AUTO_OPEN: "false",
       SKIP_PLUGIN_INSTALL: "true",
       WEPPY_MCP_DETACHED_LIFECYCLE: "true",
       LOG_LEVEL,
-    }
+      NODE_ENV: "production",
+    },
+    { respawn: true }
   );
+  log(`streamable HTTP enabled on internal :${STREAM_PORT} → public /mcp`);
 }
 
 // 2) Reverse proxy on public $PORT
@@ -310,11 +320,13 @@ proxy.on("error", (err, req, res) => {
 // + disable nginx proxy buffering for SSE (X-Accel-Buffering: no)
 proxy.on("proxyRes", (proxyRes, req) => {
   proxyRes.headers["access-control-allow-origin"] = "*";
-  proxyRes.headers["access-control-allow-methods"] = "GET, POST, PUT, DELETE, OPTIONS";
+  proxyRes.headers["access-control-allow-methods"] =
+    "GET, POST, PUT, DELETE, OPTIONS, PATCH";
   proxyRes.headers["access-control-allow-headers"] =
-    "Content-Type, Authorization, X-Requested-With";
+    "Content-Type, Authorization, X-Requested-With, Mcp-Session-Id, Last-Event-ID, Accept, X-Api-Key, X-Mcp-Token";
+  proxyRes.headers["access-control-expose-headers"] = "Mcp-Session-Id";
   const path = req?.url || "";
-  if (path.startsWith("/sse") || path.startsWith("/mcp")) {
+  if (path.startsWith("/sse") || path.startsWith("/mcp") || path.startsWith("/message")) {
     proxyRes.headers["x-accel-buffering"] = "no";
     proxyRes.headers["cache-control"] = "no-cache, no-transform";
   }
@@ -328,9 +340,10 @@ const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
       "Access-Control-Allow-Headers":
-        "Content-Type, Authorization, X-Requested-With",
+        "Content-Type, Authorization, X-Requested-With, Mcp-Session-Id, Last-Event-ID, Accept, X-Api-Key, X-Mcp-Token",
+      "Access-Control-Expose-Headers": "Mcp-Session-Id",
       "Access-Control-Max-Age": "86400",
     });
     res.end();
@@ -352,10 +365,12 @@ const server = createServer(async (req, res) => {
           endpoints: {
             mcp_sse: `${PUBLIC_BASE_URL}/sse`,
             mcp_message: `${PUBLIC_BASE_URL}/message`,
+            mcp_streamable: `${PUBLIC_BASE_URL}/mcp`,
             healthz: `${PUBLIC_BASE_URL}/healthz`,
             weppy_status: `${PUBLIC_BASE_URL}/status`,
             dashboard: `${PUBLIC_BASE_URL}/dashboard`,
           },
+          streamableHttp: STREAMABLE_ENABLED,
           auth: AUTH_TOKEN ? "bearer_required_for_mcp" : "open",
           proBypass: process.env.WEPPY_PRO_BYPASS === "0" ? "disabled" : "enabled",
           notes: [
@@ -377,8 +392,24 @@ const server = createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "unauthorized", hint: "Bearer token or ?token=" }));
       return;
     }
+    // Notion Custom Agents prefer Streamable HTTP at /mcp.
+    // Route /mcp to streamable gateway when enabled; SSE stays on /sse + /message.
+    const isStreamablePath =
+      pathname === "/mcp" || pathname.startsWith("/mcp/");
+    if (isStreamablePath && !STREAMABLE_ENABLED) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "streamable_http_disabled",
+          hint: "Set ENABLE_STREAMABLE_HTTP=true, or use /sse with Bearer token",
+          sse: `${PUBLIC_BASE_URL}/sse`,
+        })
+      );
+      return;
+    }
+    const targetPort = isStreamablePath ? STREAM_PORT : SUPERGATEWAY_PORT;
     proxy.web(req, res, {
-      target: `http://127.0.0.1:${SUPERGATEWAY_PORT}`,
+      target: `http://127.0.0.1:${targetPort}`,
       proxyTimeout: 0,
       timeout: 0,
     });
@@ -399,8 +430,12 @@ server.on("upgrade", (req, socket, head) => {
       socket.destroy();
       return;
     }
+    const isStreamablePath =
+      pathname === "/mcp" || pathname.startsWith("/mcp/");
+    const targetPort =
+      isStreamablePath && STREAMABLE_ENABLED ? STREAM_PORT : SUPERGATEWAY_PORT;
     proxy.ws(req, socket, head, {
-      target: `http://127.0.0.1:${SUPERGATEWAY_PORT}`,
+      target: `http://127.0.0.1:${targetPort}`,
     });
   } else {
     proxy.ws(req, socket, head, {
@@ -424,6 +459,9 @@ server.listen(PUBLIC_PORT, "0.0.0.0", async () => {
   log(`WEPPY bridge: ${bridgeUp ? "UP" : "NOT YET / status may differ"}`);
   log(`supergateway: ${sgUp ? "UP" : "NOT YET"}`);
   log(`ready — MCP SSE: ${PUBLIC_BASE_URL}/sse`);
+  if (STREAMABLE_ENABLED) {
+    log(`ready — MCP Streamable HTTP (Notion): ${PUBLIC_BASE_URL}/mcp`);
+  }
   log(`ready — dashboard/plugin: ${PUBLIC_BASE_URL}/dashboard (or /status)`);
 });
 
