@@ -82,7 +82,16 @@ function ensureProBypass() {
 
 ensureProBypass();
 
-function spawnLogged(name, command, args, env = {}) {
+// Track children + respawn core MCP gateway instead of killing the whole container.
+// WEPPY stdio MCP only allows ONE transport at a time; a second concurrent /sse
+// (or dirty reconnect) can crash the child with:
+//   "Already connected to a transport..."
+// If we process.exit() on that, Railway restarts mid-handshake and clients see
+// application/json 502 ("Invalid content type, expected text/event-stream").
+const respawnTimers = new Map();
+const childMeta = new Map(); // name -> { command, args, env }
+
+function spawnLogged(name, command, args, env = {}, { respawn = false } = {}) {
   log(`start ${name}: ${command} ${args.join(" ")}`);
   const child = spawn(command, args, {
     env: { ...process.env, ...env },
@@ -91,12 +100,25 @@ function spawnLogged(name, command, args, env = {}) {
   });
   child.stdout.on("data", (d) => process.stdout.write(`[${name}] ${d}`));
   child.stderr.on("data", (d) => process.stderr.write(`[${name}] ${d}`));
+  childMeta.set(name, { command, args, env, respawn });
   child.on("exit", (code, signal) => {
     log(`${name} exited code=${code} signal=${signal}`);
-    // If core process dies, bring the container down so Railway restarts
-    if (name === "supergateway" || name === "weppy-direct") {
-      process.exit(code ?? 1);
-    }
+    // drop from live children list
+    const idx = children.indexOf(child);
+    if (idx >= 0) children.splice(idx, 1);
+
+    if (!respawn) return;
+    // Debounced respawn — don't thrash if crash-looping
+    if (respawnTimers.has(name)) return;
+    const delay = 800;
+    log(`${name} will respawn in ${delay}ms`);
+    const t = setTimeout(() => {
+      respawnTimers.delete(name);
+      const meta = childMeta.get(name);
+      if (!meta) return;
+      spawnLogged(name, meta.command, meta.args, meta.env, { respawn: true });
+    }, delay);
+    respawnTimers.set(name, t);
   });
   children.push(child);
   return child;
@@ -104,10 +126,26 @@ function spawnLogged(name, command, args, env = {}) {
 
 function authOk(req) {
   if (!AUTH_TOKEN) return true;
-  const h = req.headers["authorization"] || "";
+  const url = new URL(req.url || "/", "http://x");
+  // query: ?token=... or ?access_token=...
+  const q =
+    url.searchParams.get("token") ||
+    url.searchParams.get("access_token") ||
+    url.searchParams.get("key");
+  if (q && q === AUTH_TOKEN) return true;
+
+  const h = String(req.headers["authorization"] || req.headers["Authorization"] || "");
+  if (!h) {
+    // some clients send raw token or x-api-key
+    const x = req.headers["x-api-key"] || req.headers["x-mcp-token"] || "";
+    return x === AUTH_TOKEN;
+  }
+  // exact / case-insensitive Bearer
   if (h === `Bearer ${AUTH_TOKEN}`) return true;
-  const q = new URL(req.url, "http://x").searchParams.get("token");
-  return q === AUTH_TOKEN;
+  if (h.toLowerCase() === `bearer ${AUTH_TOKEN}`.toLowerCase()) return true;
+  // raw token without scheme
+  if (h === AUTH_TOKEN) return true;
+  return false;
 }
 
 function isMcpPath(pathname) {
@@ -200,7 +238,8 @@ spawnLogged(
     WEPPY_MCP_DETACHED_LIFECYCLE: "true",
     LOG_LEVEL,
     NODE_ENV: "production",
-  }
+  },
+  { respawn: true }
 );
 
 // Optional second Streamable HTTP endpoint (stateful) on another internal port
@@ -243,13 +282,27 @@ const proxy = httpProxy.createProxyServer({
   ws: true,
   xfwd: true,
   changeOrigin: true,
+  // SSE / long-lived MCP streams must not hit default proxy timeouts
+  proxyTimeout: 0,
+  timeout: 0,
 });
 
 proxy.on("error", (err, req, res) => {
   log("proxy error", err.message, req?.url);
+  // socket may be a net.Socket (upgrade) without writeHead
   if (res && !res.headersSent && typeof res.writeHead === "function") {
-    res.writeHead(502, { "Content-Type": "application/json" });
+    // Prefer SSE-shaped error only if client asked for event-stream and we already
+    // committed? Otherwise JSON is fine — but clients that expect text/event-stream
+    // will report "Invalid content type". Keep JSON for hard failures; clients must
+    // retry. Auth failures already return 401 before proxying.
+    res.writeHead(502, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-cache",
+    });
     res.end(JSON.stringify({ error: "bad_gateway", detail: err.message }));
+  } else if (res && typeof res.destroy === "function") {
+    try { res.destroy(); } catch { /* ignore */ }
   }
 });
 
@@ -326,6 +379,8 @@ const server = createServer(async (req, res) => {
     }
     proxy.web(req, res, {
       target: `http://127.0.0.1:${SUPERGATEWAY_PORT}`,
+      proxyTimeout: 0,
+      timeout: 0,
     });
     return;
   }
