@@ -119,7 +119,18 @@ if (!src.includes('return{allowed:!0,state:{...e,canUsePro:!0,status:"active"}}'
   process.exit(2);
 }
 
-if (!src.startsWith(MARKER)) {
+// Marker must NOT precede the shebang — Node ESM treats #! only on line 1.
+// Put marker right after shebang (or at top if no shebang).
+src = src.replace(new RegExp(`^${MARKER.replace(/[/*]/g, "\\$&")}\n?`), "");
+src = src.replace(new RegExp(`\n${MARKER.replace(/[/*]/g, "\\$&")}\n?`), "\n");
+if (src.startsWith("#!")) {
+  const nl = src.indexOf("\n");
+  if (nl !== -1) {
+    src = src.slice(0, nl + 1) + MARKER + "\n" + src.slice(nl + 1);
+  } else {
+    src = src + "\n" + MARKER + "\n";
+  }
+} else if (!src.startsWith(MARKER)) {
   src = `${MARKER}\n${src}`;
 }
 
