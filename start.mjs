@@ -11,12 +11,14 @@
  *   supergateway --stdio → @weppy/roblox-mcp
  *     └─ WEPPY also binds HTTP bridge on 127.0.0.1:3002 (Studio plugin API)
  *
- * IMPORTANT:
- *   Roblox Studio plugin expects an HTTP bridge. Official default is
- *   http://127.0.0.1:3002 (localhost only). For remote Studio you MUST either:
- *     A) Run WEPPY on the same Windows/Mac machine as Studio (recommended), or
- *     B) Tunnel Railway → Studio machine (cloudflared/ngrok), or
- *     C) Point plugin custom host (if available) to this public URL.
+ * IMPORTANT multi-user (Railway shared MCP):
+ *   Studio plugin default is http://127.0.0.1:3002. For remote Studio → Railway:
+ *     Plugin settings → Server Host = weppy-mcp-production.up.railway.app
+ *                       Server Port = 443  (HTTPS public proxy)
+ *     WS path: wss://…/plugin/ws  (proxied by this start.mjs)
+ *
+ *   Streamable /mcp (Notion) MUST share the primary HTTP bridge via client-mode
+ *   (same HTTP_PORT). Isolated PORT+1 leaves Notion with empty pluginClients.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -248,6 +250,14 @@ spawnLogged(
 const STREAMABLE_ENABLED = process.env.ENABLE_STREAMABLE_HTTP === "true";
 const STREAM_PORT = parseInt(process.env.STREAMABLE_PORT || "8788", 10);
 if (STREAMABLE_ENABLED) {
+  // CRITICAL multi-user fix:
+  // Use the SAME HTTP_PORT as the primary WEPPY bridge (default 3002).
+  // Second process hits EADDRINUSE → WEPPY auto-switches to CLIENT MODE and
+  // registers with the primary server. Commands from Notion /mcp then share
+  // the same pluginClients as Studio plugins connected to the primary bridge.
+  //
+  // Old behavior (HTTP_PORT+1) spawned an isolated WEPPY with empty
+  // pluginClients → Notion "ready" but Studio always disconnected.
   spawnLogged(
     "supergateway-streamable",
     process.execPath,
@@ -273,9 +283,9 @@ if (STREAMABLE_ENABLED) {
       LOG_LEVEL === "debug" ? "debug" : "info",
     ],
     {
-      // Separate HTTP bridge port so it doesn't clash with the SSE WEPPY instance
-      HTTP_HOST: "127.0.0.1",
-      HTTP_PORT: String(WEPPY_HTTP_PORT + 1),
+      // SAME host/port as primary → client-mode join (do NOT use PORT+1)
+      HTTP_HOST: WEPPY_HTTP_HOST,
+      HTTP_PORT: String(WEPPY_HTTP_PORT),
       DASHBOARD_AUTO_OPEN: "false",
       SKIP_PLUGIN_INSTALL: "true",
       WEPPY_MCP_DETACHED_LIFECYCLE: "true",
@@ -284,7 +294,9 @@ if (STREAMABLE_ENABLED) {
     },
     { respawn: true }
   );
-  log(`streamable HTTP enabled on internal :${STREAM_PORT} → public /mcp`);
+  log(
+    `streamable HTTP enabled on internal :${STREAM_PORT} → public /mcp (client-mode join on ${WEPPY_HTTP_HOST}:${WEPPY_HTTP_PORT})`
+  );
 }
 
 // 2) Reverse proxy on public $PORT
